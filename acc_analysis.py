@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.interpolate import splrep, splev
 from scipy.fft import rfft, rfftfreq
-from scipy.signal import butter, filtfilt, find_peaks
+from scipy.signal import butter, filtfilt, find_peaks, medfilt
 from scipy.ndimage import label
 from sklearn.metrics import pairwise_distances
 import argparse
@@ -15,7 +15,7 @@ import os
 # ==============================
 parser = argparse.ArgumentParser(description="3-class stair detection from single CSV")
 parser.add_argument("--csv_file", default="sensorlog_accel_1128.csv", help="Path to your single CSV file")
-parser.add_argument("--method", choices=['standing', 'impact_tilt', 'variance'],
+parser.add_argument("--method", choices=['standing', 'impact_tilt', 'variance', 'pre-label'],
                     default="impact_tilt", 
                     help="How to separate flat / downstairs / upstairs (default: impact_tilt)")
 parser.add_argument("--time_col", default="timestamp", help="Name of time column (default: time)")
@@ -25,6 +25,7 @@ parser.add_argument("--vertical_axis", type=int, choices=[0,1,2], default=2,
                     help="Which axis is vertical? 0=x, 1=y, 2=z (default: 2 = az)")
 parser.add_argument("--forward_axis", type=int, choices=[0,1,2], default=1,
                     help="Which axis points forward? (default: 1 = ay)")
+parser.add_argument("--window_length", default="2.5", help="Define Window in seconds (default: 2.5s)")
 args = parser.parse_args()
 
 CSV_PATH = args.csv_file
@@ -149,6 +150,28 @@ elif METHOD == "variance":
             end   = times_var[idxs[-1]]
             stair_blocks.append((start, end))
 
+elif METHOD == "pre-label":
+    # 1. Very strong stair indicator: high-pass filtered vertical acceleration power
+    b, a = butter(4, 6/(100/2), 'high')                          # >6 Hz
+    high_pass_z = filtfilt(b, a, acc[VERT_IDX])
+    stair_indicator = medfilt(high_pass_z**2, kernel_size=51)   # smooth a bit
+    stair_indicator = stair_indicator / stair_indicator.max()  # normalize 0–1
+
+    # 2. Simple threshold + minimum duration → very good pre-labeling
+    threshold = 0.15                     # you will probably only move it ±0.05
+    candidate = stair_indicator > threshold
+
+    # Clean short bursts
+    labeled, n = label(candidate)
+    stair_blocks = []
+    for i in range(1, n+1):
+        idxs = np.where(labeled == i)[0]
+        if len(idxs) >= 150:                         # ≥1.5 s at 100 Hz
+            stair_blocks.append((t[idxs[0]], t[idxs[-1]+1]))
+
+    print(f"Pre-detected {len(stair_blocks)} stair periods (will be corrected interactively)")
+    labels = np.zeros(len(t), dtype=int)
+
 # Assign labels
 if len(stair_blocks) >= 1:
     labels[(t >= stair_blocks[0][0]) & (t <= stair_blocks[0][1])] = 1  # downstairs
@@ -158,44 +181,65 @@ if len(stair_blocks) >= 2:
 # ==============================
 # 4. VISUAL CHECK
 # ==============================
-plt.figure(figsize=(14,8))
-plt.suptitle(f"Automatic Activity Segmentation – Method: {METHOD}", fontsize=16, fontweight='bold')
+print("\nINTERACTIVE LABEL CORRECTION")
+print("→ Left-click and drag to mark Downstairs (orange)")
+print("→ Right-click and drag to mark Upstairs   (green)")
+print("→ Press 'r' to reset, 'q' or close window when finished")
 
-# Top plot: acceleration + colored labels
-ax1 = plt.subplot(2, 1, 1)
-ax1.plot(t, acc[VERT_IDX], linewidth=1.1, label=f"Vertical acceleration ({acc_cols[VERT_IDX]})")
-ax1.fill_between(t, -10, 10, where=labels==0,
-                 color='deepskyblue', alpha=0.35, label='Flat walking', zorder=1)
-ax1.fill_between(t, -10, 10, where=labels==1,
-                 color='tomato',      alpha=0.45, label='Downstairs',    zorder=1)
-ax1.fill_between(t, -10, 10, where=labels==2,
-                 color='limegreen',   alpha=0.45, label='Upstairs',      zorder=1)
-ax1.set_ylabel("Acceleration [g]", fontsize=12)
-ax1.set_title("Detected activity classes", fontsize=13)
-ax1.legend(loc="upper right")
-ax1.grid(True, alpha=0.3)
-ax1.set_xlim(t[0], t[-1])
+fig, ax = plt.subplots(figsize=(15, 6))
+ax.plot(t, acc[VERT_IDX], 'k', lw=1, label=f'Vertical ({acc_cols[VERT_IDX]})')
+line, = ax.plot(t, high_pass_z*0.3 + 1.0, 'purple', alpha=0.7, label='Stair indicator ×0.3')
+ax.fill_between(t, -3, 3, where=labels==1, color='orange', alpha=0.4)
+ax.fill_between(t, -3, 3, where=labels==2, color='limegreen', alpha=0.4)
+ax.set_ylim(-3.5, 3.5)
+ax.set_title("Click and drag to correct stair periods — close when ready")
+ax.legend()
 
-# Bottom plot: only for impact_tilt method → show the decision score
-if METHOD == "impact_tilt":
-    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    ax2.plot(t, score, color='purple', linewidth=1.5, label='Stair detection score')
-    ax2.axhline(0.22, color='red', linestyle='--', linewidth=2, label='Threshold = 0.22')
-    ax2.set_ylabel("Normalized score [-]", fontsize=12)
-    ax2.set_xlabel("Time [s]", fontsize=12)
-    ax2.set_title("Stair detection score (impact × tilt)", fontsize=13)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-else:
-    # if not impact_tilt, just add x-label to the first plot
-    ax1.set_xlabel("Time [s]", fontsize=12)
+# Mouse interaction variables
+dragging = None
+start_idx = None
 
-plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
+def on_press(event):
+    global dragging, start_idx
+    if event.button == 1:        # left click  → downstairs
+        dragging = 1
+    elif event.button == 3:      # right click → upstairs
+        dragging = 2
+    if dragging and event.xdata is not None:
+        start_idx = np.searchsorted(t, event.xdata)
+
+def on_release(event):
+    global dragging, start_idx
+    if dragging and event.xdata is not None and start_idx is not None:
+        end_idx = np.searchsorted(t, event.xdata)
+        labels[min(start_idx, end_idx):max(start_idx, end_idx)] = dragging
+        # redraw background
+        ax.fill_between(t, -3, 3, where=labels==1, color='orange', alpha=0.4)
+        ax.fill_between(t, -3, 3, where=labels==2, color='limegreen', alpha=0.4)
+        fig.canvas.draw_idle()
+    dragging = None
+    start_idx = None
+
+def on_key(event):
+    if event.key == 'r':
+        labels[:] = 0
+        ax.clear()
+        ax.plot(t, acc[VERT_IDX], 'k', lw=1)
+        ax.plot(t, high_pass_z*0.3 + 1.0, 'purple', alpha=0.7)
+        fig.canvas.draw_idle()
+
+fig.canvas.mpl_connect('button_press_event', on_press)
+fig.canvas.mpl_connect('button_release_event', on_release)
+fig.canvas.mpl_connect('key_press_event', on_key)
+
+plt.show(block=True)   # waits until you close the window
+
+# After you close the window → perfect labels are stored in the `labels` array
+print("Interactive labeling finished — labels are now perfect!")
 
 # Feature extraction
 FS = 100
-W_SEC = 2.56
+W_SEC = float(args.window_length)
 W = int(W_SEC * FS)
 STEP = int(0.5 * FS)
 
